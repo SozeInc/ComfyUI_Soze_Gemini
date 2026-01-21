@@ -1,0 +1,30 @@
+[project]
+name = "comfyui_soze_gemini"
+description = "Ported from ComfyUI-IF_Gemini to support Gemini 3.0 API calls.  Please NOTE: Open Router Functionality has been removed."
+version = "1.0.0"
+license = { file = "MIT License" }
+dependencies = [
+    # Core dependencies
+    "torch>=2.0.0",
+    "pillow>=10.0.0",
+    "numpy>=1.24.0",
+
+    # Google Gemini API
+    "google-generativeai",
+    "google-genai",
+
+    # Utilities
+    "python-dotenv",
+    "requests>=2.31.0",
+]
+
+[project.urls]
+Repository = "https://github.com/SozeInc/ComfyUI_Soze_Gemini"
+
+# Used by Comfy Registry https://comfyregistry.org
+[tool.comfy]
+PublisherId = "sozeinc"
+DisplayName = "comfyui_soze_gemini"
+
+
+
