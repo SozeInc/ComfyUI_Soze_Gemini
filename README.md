@@ -35,10 +35,9 @@ I am happy to accept PRs and bug reports and will integrate or resolve as possib
      - `medium`: Moderate reasoning (4096 token budget) 
      - `high`: Extensive reasoning (16384 token budget)
    - **Media Resolution** (Gemini 3 only): Controls image/video processing resolution
-     - `low`: 512px max dimension
-     - `medium`: 1024px max dimension (default)
-     - `high`: 2048px max dimension
-     - `ultra_high`: 4096px max dimension
+     - 1K
+     - 2K
+     - 4K
    - Chat Mode: Enable conversation history for interactive sessions
    - Clear History: Clear chat history when enabled (works with Chat Mode)
    - Seed: For reproducible results
