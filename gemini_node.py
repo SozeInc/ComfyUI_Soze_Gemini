@@ -283,8 +283,8 @@ class Soze_GeminiAdvanced:
                     {"default": "none"},
                 ),
                 "media_resolution": (
-                    ["low", "medium", "high", "ultra_high"],
-                    {"default": "medium"},
+                    ["1K", "2K", "4K"],
+                    {"default": "1K"},
                 ),
             },
             "optional": {
@@ -296,7 +296,7 @@ class Soze_GeminiAdvanced:
                 "sequential_generation": ("BOOLEAN", {"default": False}),
                 "batch_count": ("INT", {"default": 1, "min": 1, "max": 20}),
                 "aspect_ratio": (
-                    ["none", "1:1", "16:9", "9:16", "4:3", "3:4", "5:4", "4:5"],
+                    ["none", "1:1", "2:3", "3:2", "3:4", "4:3", "4:5", "5:4", "9:16", "16:9", "21:9"],
                     {"default": "none"},
                 ),
                 "external_api_key": ("STRING", {"default": ""}),
@@ -313,7 +313,7 @@ class Soze_GeminiAdvanced:
     RETURN_TYPES = ("STRING", "IMAGE")
     RETURN_NAMES = ("text", "image")
     FUNCTION = "generate_content"
-    CATEGORY = "ImpactFrames💥🎞️/LLM"
+    CATEGORY = "Soze Nodes"
 
     def generate_content(
         self,
@@ -713,6 +713,9 @@ class Soze_GeminiAdvanced:
                 "3:4": (896, 1280),  # Standard portrait
                 "5:4": (1024, 819),  # Medium landscape format
                 "4:5": (819, 1024),  # Medium portrait format
+                "2:3": (836, 1254),
+                "3:2": (1254, 836),
+                "21:9": (1536, 640),
             }
 
             # Get target dimensions based on aspect ratio
@@ -738,12 +741,21 @@ class Soze_GeminiAdvanced:
             
             # Add Image Config if appropriate
             using_image_config = False
-            if aspect_ratio != "none" and hasattr(types, "ImageConfig"):
+            image_config_args = {}
+            
+            if aspect_ratio != "none":
+                image_config_args["aspect_ratio"] = aspect_ratio
+                
+            # Handle resolution/image_size
+            if media_resolution in ["1K", "2K", "4K"]:
+                image_config_args["image_size"] = media_resolution
+                
+            if image_config_args and hasattr(types, "ImageConfig"):
                 try:
                     # Note: Using aspect_ratio from the input directly which matches API expectations (e.g. "16:9")
-                    gen_config_args["image_config"] = types.ImageConfig(aspect_ratio=aspect_ratio)
+                    gen_config_args["image_config"] = types.ImageConfig(**image_config_args)
                     using_image_config = True
-                    logger.info(f"Using ImageConfig with aspect ratio: {aspect_ratio}")
+                    logger.info(f"Using ImageConfig: {image_config_args}")
                 except Exception as e:
                     logger.warning(f"Failed to create ImageConfig: {e}. Falling back to prompt engineering.")
             
@@ -766,9 +778,9 @@ class Soze_GeminiAdvanced:
             if images is not None and isinstance(images, torch.Tensor) and images.nelement() > 0:
                 # Determine max size based on media resolution setting
                 media_resolution_sizes = {
-                    "low": 512,
-                    "medium": 1024,
-                    "high": 2048,
+                    "low": 512, "1K": 1024,
+                    "medium": 1024, "2K": 2048,
+                    "high": 2048, "4K": 4096,
                     "ultra_high": 4096
                 }
                 max_input_size = media_resolution_sizes.get(media_resolution, 1024)
