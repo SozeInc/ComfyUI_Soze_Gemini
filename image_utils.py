@@ -96,6 +96,9 @@ def prepare_batch_images(images, max_images=6, max_size=1024):
         # Handle list of tensors
         elif isinstance(images, list):
             for img_tensor in images[:max_images]:
+                # Skip None images (can occur from ComfyUI variable image count workflows)
+                if img_tensor is None:
+                    continue
                 pil_image = tensor_to_pil(img_tensor)
                 pil_image = resize_image(pil_image, max_size)
                 prepared_images.append(pil_image)

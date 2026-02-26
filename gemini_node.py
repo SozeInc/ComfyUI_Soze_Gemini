@@ -272,6 +272,7 @@ class Soze_GeminiAdvanced:
                     [
                         # Gemini 3 models
                         "gemini-3-pro-image-preview",
+                        "gemini-3.1-flash-image-preview",
                         "gemini-3-flash-preview",
                         "gemini-3-pro-preview",
                     ],
@@ -630,12 +631,11 @@ class Soze_GeminiAdvanced:
             # For Gemini, model names should be image-capable
             image_capable_models = [
                 "gemini-3-pro-image-preview",
-                "gemini-3-flash-preview",
-                "gemini-3-pro-preview",
+                "gemini-3.1-flash-image-preview",
             ]
             if model_name not in image_capable_models:
                 original_model = model_name
-                model_name = "gemini-3-pro-image-preview"  # A safe default for Gemini
+                model_name = "gemini-3.1-flash-image-preview"  # A safe default for Gemini
                 logger.warning(
                     f"Model '{original_model}' may not support image generation. "
                     f"Switched to '{model_name}'."
@@ -878,14 +878,32 @@ class Soze_GeminiAdvanced:
                         step_images_bytes = []
                         step_text = ""
                         finish_reason = None
+                        safety_info = ""
+                        prompt_feedback_info = ""
+                        
+                        # Check for prompt feedback (may contain block reason)
+                        if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+                            pf = response.prompt_feedback
+                            if hasattr(pf, 'block_reason') and pf.block_reason:
+                                prompt_feedback_info += f"Block reason: {pf.block_reason}. "
+                            if hasattr(pf, 'safety_ratings') and pf.safety_ratings:
+                                ratings = [f"{r.category.name}:{r.probability.name}" for r in pf.safety_ratings if hasattr(r, 'category') and hasattr(r, 'probability')]
+                                if ratings:
+                                    prompt_feedback_info += f"Prompt safety: {', '.join(ratings)}. "
                             
                         if hasattr(response, 'candidates') and response.candidates:
                             for candidate in response.candidates:
                                 if hasattr(candidate, 'finish_reason'):
                                     finish_reason = candidate.finish_reason
                                     logger.info(f"Step {i+1} finish reason: {finish_reason}")
+                                
+                                # Extract safety ratings from candidate
+                                if hasattr(candidate, 'safety_ratings') and candidate.safety_ratings:
+                                    ratings = [f"{r.category.name}:{r.probability.name}" for r in candidate.safety_ratings if hasattr(r, 'category') and hasattr(r, 'probability')]
+                                    if ratings:
+                                        safety_info = f"Safety ratings: {', '.join(ratings)}. "
                                     
-                                if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
+                                if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts') and candidate.content.parts is not None:
                                     model_parts = []
                                     for part in candidate.content.parts:
                                         # Extract text
@@ -940,7 +958,14 @@ class Soze_GeminiAdvanced:
                             all_generated_images_bytes.extend(step_images_bytes)
                             status_text += f"Step {i+1} (seed {current_seed}): Generated {len(step_images_bytes)} image(s)\n"
                         else:
-                            status_text += f"Step {i+1} (seed {current_seed}): No images generated\n"
+                            finish_info = f" (Reason: {finish_reason})" if finish_reason else ""
+                            status_text += f"Step {i+1} (seed {current_seed}): No images generated{finish_info}\n"
+                            
+                            # Include additional diagnostic info
+                            if prompt_feedback_info:
+                                status_text += f"Prompt feedback: {prompt_feedback_info}\n"
+                            if safety_info:
+                                status_text += f"{safety_info}\n"
                                 
                             # If no images were generated in this step, we might want to stop the sequence
                             if finish_reason and "SAFETY" in str(finish_reason).upper():
@@ -1023,6 +1048,18 @@ class Soze_GeminiAdvanced:
                         batch_images_bytes = []
                         response_text = ""
                         finish_reason = None
+                        safety_info = ""
+                        prompt_feedback_info = ""
+
+                        # Check for prompt feedback (may contain block reason)
+                        if hasattr(response, 'prompt_feedback') and response.prompt_feedback:
+                            pf = response.prompt_feedback
+                            if hasattr(pf, 'block_reason') and pf.block_reason:
+                                prompt_feedback_info += f"Block reason: {pf.block_reason}. "
+                            if hasattr(pf, 'safety_ratings') and pf.safety_ratings:
+                                ratings = [f"{r.category.name}:{r.probability.name}" for r in pf.safety_ratings if hasattr(r, 'category') and hasattr(r, 'probability')]
+                                if ratings:
+                                    prompt_feedback_info += f"Prompt safety: {', '.join(ratings)}. "
 
                         # Check for finish reason which might explain why no images were generated
                         if hasattr(response, 'candidates') and response.candidates:
@@ -1031,8 +1068,14 @@ class Soze_GeminiAdvanced:
                                 if hasattr(candidate, 'finish_reason'):
                                     finish_reason = candidate.finish_reason
                                     logger.info(f"Finish reason: {finish_reason}")
+                                
+                                # Extract safety ratings from candidate
+                                if hasattr(candidate, 'safety_ratings') and candidate.safety_ratings:
+                                    ratings = [f"{r.category.name}:{r.probability.name}" for r in candidate.safety_ratings if hasattr(r, 'category') and hasattr(r, 'probability')]
+                                    if ratings:
+                                        safety_info = f"Safety ratings: {', '.join(ratings)}. "
                                     
-                                if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts'):
+                                if hasattr(candidate, 'content') and hasattr(candidate.content, 'parts') and candidate.content.parts is not None:
                                     for part in candidate.content.parts:
                                         # Extract text
                                         if hasattr(part, 'text') and part.text:
@@ -1064,6 +1107,12 @@ class Soze_GeminiAdvanced:
                             # Include finish reason in status if available
                             finish_info = f" (Reason: {finish_reason})" if finish_reason else ""
                             status_text += f"Batch {i+1} (seed {current_seed}): No images found in response{finish_info}\n"
+                            
+                            # Include additional diagnostic info
+                            if prompt_feedback_info:
+                                status_text += f"Prompt feedback: {prompt_feedback_info}\n"
+                            if safety_info:
+                                status_text += f"{safety_info}\n"
                                 
                             # Add more specific guidance for IMAGE_SAFETY or similar issues
                             if finish_reason and "SAFETY" in str(finish_reason).upper():
@@ -1189,9 +1238,10 @@ def get_available_models(api_key):
         # Ensure we always have the default models available
         default_models = [
             "gemini-3-pro-image-preview",
+            "gemini-3.1-flash-image-preview",
             "gemini-3-flash-preview",
             "gemini-3-pro-preview",
-        ]
+            ]
         
         for model in default_models:
             if model not in gemini_models:
@@ -1210,9 +1260,10 @@ def get_available_models(api_key):
         # Return default Gemini models
         return [
             "gemini-3-pro-image-preview",
+            "gemini-3.1-flash-image-preview",
             "gemini-3-flash-preview",
             "gemini-3-pro-preview",
-        ]
+            ]
 
 def check_gemini_api_key(api_key):
     """Check if a Gemini API key is valid by attempting to list models"""
