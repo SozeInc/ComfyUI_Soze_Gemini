@@ -32,6 +32,23 @@ except ImportError:
     types = None
 
 
+def _build_thinking_config(thinking_level):
+    """Build a ThinkingConfig that works on both old and new google-genai SDKs.
+
+    Newer SDKs accept `thinking_level` (str: minimal/low/medium/high) for Gemini 3.
+    Older SDKs only accept `thinking_budget` (int) — map the level to a budget.
+    """
+    if types is None:
+        return None
+    supported = set(getattr(types.ThinkingConfig, "model_fields", {}).keys())
+    if "thinking_level" in supported:
+        return types.ThinkingConfig(thinking_level=thinking_level)
+    # Fallback: map level → integer budget for older SDKs.
+    # -1 = dynamic (max), 0 = disabled where allowed.
+    budget_map = {"minimal": 0, "low": 1024, "medium": 8192, "high": -1}
+    return types.ThinkingConfig(thinking_budget=budget_map.get(thinking_level, 0))
+
+
 from .env_utils import get_api_key, get_base_url, get_effective_api_key
 from .utils import ChatHistory
 from .image_utils import (
@@ -53,6 +70,19 @@ logging.getLogger("google.genai").setLevel(logging.ERROR)  # More restrictive
 logging.getLogger("google.auth").setLevel(logging.ERROR)  # More restrictive
 logging.getLogger("urllib3").setLevel(logging.ERROR)  # Add urllib3
 logging.getLogger("requests").setLevel(logging.ERROR)  # Add requests
+
+gemini_models = [
+            "gemini-3-pro-image-preview",
+            "gemini-3.1-pro-preview",
+            "gemini-3.1-flash-image-preview",
+            "gemini-3.1-flash-lite-preview",
+            "gemini-3-flash-preview",
+            "gemini-3-pro-preview",
+            ]
+gemini_image_models = [
+                "gemini-3-pro-image-preview",
+                "gemini-3.1-flash-image-preview",
+            ]
 
 
 def generate_consistent_seed(input_seed=0, use_random=False):
@@ -269,19 +299,13 @@ class Soze_GeminiAdvanced:
                     {"default": "generate_images"},
                 ),
                 "model_name": (
-                    [
-                        # Gemini 3 models
-                        "gemini-3-pro-image-preview",
-                        "gemini-3.1-flash-image-preview",
-                        "gemini-3-flash-preview",
-                        "gemini-3-pro-preview",
-                    ],
-                    {"default": "gemini-3-flash-preview"},
+                    gemini_models,
+                    {"default": gemini_models[0]},
                 ),
                 "temperature": ("FLOAT", {"default": 0.8, "min": 0.0, "max": 1.0, "step": 0.01}),
                 "thinking_level": (
-                    ["none", "low", "medium", "high"],
-                    {"default": "none"},
+                    ["minimal", "low", "medium", "high"],
+                    {"default": "minimal"},
                 ),
                 "media_resolution": (
                     ["1K", "2K", "4K"],
@@ -320,9 +344,9 @@ class Soze_GeminiAdvanced:
         self,
         prompt,
         operation_mode="analysis",
-        model_name="gemini-3-flash-preview",
+        model_name=gemini_models[0],
         temperature=0.4,
-        thinking_level="none",
+        thinking_level="minimal",
         media_resolution="medium",
         images=None,
         video=None,
@@ -456,16 +480,8 @@ class Soze_GeminiAdvanced:
             generation_config_params["system_instruction"] = system_prompt
         
         # Add Thinking Level for Gemini 3 models
-        if thinking_level != "none":
-            # Convert thinking level to appropriate budget values
-            thinking_budget_map = {
-                "low": 1024,
-                "medium": 4096, 
-                "high": 16384
-            }
-            if thinking_level in thinking_budget_map:
-                generation_config_params["thinking_budget"] = thinking_budget_map[thinking_level]
-                logger.info(f"Using thinking budget: {thinking_budget_map[thinking_level]} for level: {thinking_level}")
+        generation_config_params["thinking_config"] = _build_thinking_config(thinking_level)
+        logger.info(f"Using thinking_level: {thinking_level}")
         
         # Add Media Resolution for Gemini 3 models (affects image/video processing)
         if media_resolution != "medium":  # medium is default
@@ -601,6 +617,7 @@ class Soze_GeminiAdvanced:
             if len(error_msg) > 500:
                 error_msg = error_msg[:500] + "... [truncated]"
             generated_content = f"Error: {error_msg}"
+            raise e  # Re-raise the exception after logging
 
         # For analysis mode, return the text response and an empty placeholder image
         return (generated_content, create_placeholder_image())
@@ -612,7 +629,7 @@ class Soze_GeminiAdvanced:
         images=None,
         batch_count=1,
         temperature=0.4,
-        thinking_level="none",
+        thinking_level="minimal",
         media_resolution="medium",
         seed=0,
         max_images=6,
@@ -629,13 +646,10 @@ class Soze_GeminiAdvanced:
             # This determination of `client_type` must happen before the model name is validated.
             # We peek ahead to see what client will be created.
             # For Gemini, model names should be image-capable
-            image_capable_models = [
-                "gemini-3-pro-image-preview",
-                "gemini-3.1-flash-image-preview",
-            ]
+            image_capable_models = gemini_image_models
             if model_name not in image_capable_models:
                 original_model = model_name
-                model_name = "gemini-3.1-flash-image-preview"  # A safe default for Gemini
+                model_name = image_capable_models[0]  # A safe default for Gemini
                 logger.warning(
                     f"Model '{original_model}' may not support image generation. "
                     f"Switched to '{model_name}'."
@@ -760,16 +774,8 @@ class Soze_GeminiAdvanced:
                     logger.warning(f"Failed to create ImageConfig: {e}. Falling back to prompt engineering.")
             
             # Add Thinking Level for Gemini 3 models
-            if thinking_level != "none":
-                # Convert thinking level to appropriate budget values
-                thinking_budget_map = {
-                    "low": 1024,
-                    "medium": 4096, 
-                    "high": 16384
-                }
-                if thinking_level in thinking_budget_map:
-                    gen_config_args["thinking_budget"] = thinking_budget_map[thinking_level]
-                    logger.info(f"Using thinking budget: {thinking_budget_map[thinking_level]} for image generation with level: {thinking_level}")
+            gen_config_args["thinking_config"] = _build_thinking_config(thinking_level)
+            logger.info(f"Using thinking_level: {thinking_level} for image generation")
 
             generation_config = types.GenerateContentConfig(**gen_config_args)
 
@@ -1236,12 +1242,7 @@ def get_available_models(api_key):
                 gemini_models.append(model_name)
         
         # Ensure we always have the default models available
-        default_models = [
-            "gemini-3-pro-image-preview",
-            "gemini-3.1-flash-image-preview",
-            "gemini-3-flash-preview",
-            "gemini-3-pro-preview",
-            ]
+        default_models = gemini_models
         
         for model in default_models:
             if model not in gemini_models:
@@ -1258,12 +1259,7 @@ def get_available_models(api_key):
         logger.error(f"Error retrieving models: {error_msg}")
         
         # Return default Gemini models
-        return [
-            "gemini-3-pro-image-preview",
-            "gemini-3.1-flash-image-preview",
-            "gemini-3-flash-preview",
-            "gemini-3-pro-preview",
-            ]
+        return gemini_models
 
 def check_gemini_api_key(api_key):
     """Check if a Gemini API key is valid by attempting to list models"""
