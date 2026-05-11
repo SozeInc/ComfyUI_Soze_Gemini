@@ -378,6 +378,7 @@ class Soze_GeminiAdvanced:
                     {"default": "none"},
                 ),
                 "external_api_key": ("STRING", {"default": ""}),
+                "bypass": ("BOOLEAN", {"default": False}),
                 "chat_mode": ("BOOLEAN", {"default": False}),
                 "clear_history": ("BOOLEAN", {"default": False}),
                 "structured_output": ("BOOLEAN", {"default": False}),
@@ -410,6 +411,7 @@ class Soze_GeminiAdvanced:
         batch_count=1,
         aspect_ratio="none",
         external_api_key="",
+        bypass=False,
         chat_mode=False,
         clear_history=False,
         structured_output=False,
@@ -420,6 +422,11 @@ class Soze_GeminiAdvanced:
         system_prompt="",
     ):
         """Generate content using Gemini model with various input types."""
+
+        # Bypass: short-circuit without any API call or processing.
+        if bypass:
+            logger.info("Soze_GeminiAdvanced: bypass=True — skipping all processing")
+            return ("", None)
 
         # Check if Google Generative AI SDK is available
         if not self.genai_available:
