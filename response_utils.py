@@ -4,15 +4,20 @@ from io import BytesIO
 from .image_utils import tensor_to_pil, resize_image, sample_video_frames
 from .audio_utils import process_audio
 
-def prepare_response(prompt, input_type, text_input=None, images=None, video=None, audio=None, max_images=6):
-    """Prepare content based on input type for Gemini API"""
+def prepare_response(prompt, input_type, text_input=None, images=None, frames=None, audio=None, max_images=6):
+    """Prepare content based on input type for Gemini API.
+
+    `frames` is an IMAGE-tensor batch of video frames (no audio). For real video
+    files with audio, the caller should upload via the Files API and build the
+    content directly.
+    """
     # Auto-detect input type if needed
     detected_type = input_type
-    
+
     # Override input_type based on provided inputs
     if input_type == "text" and images is not None and isinstance(images, torch.Tensor) and images.nelement() > 0:
         detected_type = "image"
-    elif video is not None and isinstance(video, torch.Tensor) and video.nelement() > 0:
+    elif frames is not None and isinstance(frames, torch.Tensor) and frames.nelement() > 0:
         detected_type = "video"
     elif audio is not None:
         detected_type = "audio"
@@ -76,9 +81,9 @@ def prepare_response(prompt, input_type, text_input=None, images=None, video=Non
         else:
             raise ValueError("No valid images provided")
             
-    elif detected_type == "video" and video is not None:
-        # Handle video input (sequence of frames)
-        frames = sample_video_frames(video)
+    elif detected_type == "video" and frames is not None:
+        # Handle video frames input (sequence of still frames, no audio)
+        frames = sample_video_frames(frames)
         if frames:
             # Convert frames to proper format
             parts = [{"text": f"Analyzing video frames. {prompt}"}]

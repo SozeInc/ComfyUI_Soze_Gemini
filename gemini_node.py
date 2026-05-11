@@ -32,6 +32,58 @@ except ImportError:
     types = None
 
 
+SUPPORTED_VIDEO_EXTS = {
+    ".mp4": "video/mp4",
+    ".mov": "video/quicktime",
+    ".webm": "video/webm",
+    ".avi": "video/x-msvideo",
+    ".mpeg": "video/mpeg",
+    ".mpg": "video/mpeg",
+    ".flv": "video/x-flv",
+    ".wmv": "video/x-ms-wmv",
+    ".3gp": "video/3gpp",
+    ".mkv": "video/x-matroska",
+}
+
+
+def upload_video_for_gemini(client, video_path, poll_timeout=300, poll_interval=2):
+    """Upload a video file via the Files API and wait until it's ACTIVE.
+
+    Returns the File object ready to be passed as a content part.
+    Raises FileNotFoundError, ValueError, or TimeoutError on failure.
+    """
+    if not video_path:
+        raise ValueError("video path is empty")
+    if not os.path.exists(video_path):
+        raise FileNotFoundError(f"Video file not found: {video_path}")
+
+    ext = os.path.splitext(video_path)[1].lower()
+    if ext not in SUPPORTED_VIDEO_EXTS:
+        raise ValueError(
+            f"Unsupported video extension '{ext}'. Supported: {sorted(SUPPORTED_VIDEO_EXTS)}"
+        )
+
+    raw_client = client.client if isinstance(client, UniversalClient) else client
+    logger.info(f"Uploading video to Gemini Files API: {video_path}")
+    uploaded = raw_client.files.upload(file=video_path)
+
+    deadline = time.time() + poll_timeout
+    while True:
+        state = getattr(getattr(uploaded, "state", None), "name", None) or str(getattr(uploaded, "state", ""))
+        if state == "ACTIVE":
+            logger.info(f"Video file is ACTIVE: {uploaded.name}")
+            return uploaded
+        if state == "FAILED":
+            raise RuntimeError(f"Video upload FAILED for {video_path}")
+        if time.time() > deadline:
+            raise TimeoutError(
+                f"Video upload did not become ACTIVE within {poll_timeout}s (last state: {state})"
+            )
+        logger.info(f"Waiting for video to process (state: {state})...")
+        time.sleep(poll_interval)
+        uploaded = raw_client.files.get(name=uploaded.name)
+
+
 def _build_thinking_config(thinking_level):
     """Build a ThinkingConfig that works on both old and new google-genai SDKs.
 
@@ -314,7 +366,8 @@ class Soze_GeminiAdvanced:
             },
             "optional": {
                 "images": ("IMAGE",),
-                "video": ("IMAGE",),
+                "video": ("STRING", {"default": "", "multiline": False}),
+                "frames": ("IMAGE",),
                 "audio": ("AUDIO",),
                 "system_prompt": ("STRING", {"multiline": True, "default": ""}),
                 "seed": ("INT", {"default": 0, "min": 0, "max": 0xFFFFFFFF}),
@@ -349,7 +402,8 @@ class Soze_GeminiAdvanced:
         thinking_level="minimal",
         media_resolution="medium",
         images=None,
-        video=None,
+        video="",
+        frames=None,
         audio=None,
         seed=0,
         sequential_generation=False,
@@ -496,34 +550,56 @@ class Soze_GeminiAdvanced:
             
         generation_config = types.GenerateContentConfig(**generation_config_params)
 
+        # If a video file path was supplied, upload it once and reuse the File object.
+        uploaded_video_file = None
+        video_path = video.strip() if isinstance(video, str) else ""
+        if video_path:
+            try:
+                uploaded_video_file = upload_video_for_gemini(client, video_path)
+            except Exception as upload_err:
+                logger.error(f"Video upload failed: {upload_err}", exc_info=True)
+                return (f"Error uploading video: {upload_err}", create_placeholder_image())
+
         try:
             if chat_mode:
                 # Handle chat mode with proper history
                 history = self.chat_history.get_messages_for_api()
 
-                # Create appropriate content parts based on input type
-                contents = prepare_response(
-                    prompt,
-                    "image" if images is not None else ("video" if video is not None else ("audio" if audio is not None else "text")),
-                    None,
-                    images,
-                    video,
-                    audio,
-                    max_images,
-                )
-                
-                # Extract content for chat format
-                if (
-                    isinstance(contents, list)
-                    and len(contents) == 1
-                    and isinstance(contents[0], dict)
-                    and "parts" in contents[0]
-                ):
-                    current_message_parts = contents[0]["parts"]
+                if uploaded_video_file is not None:
+                    # Build parts directly: prompt text + uploaded video file.
+                    current_message_parts = [
+                        types.Part(text=prompt),
+                        types.Part(file_data=types.FileData(
+                            file_uri=uploaded_video_file.uri,
+                            mime_type=uploaded_video_file.mime_type,
+                        )),
+                    ]
+                    contents = None  # not used in this branch
                 else:
-                    # Fallback if we get unexpected format
-                    current_message_parts = [{"text": prompt}]
-                    logger.warning("Unexpected format from prepare_response, using text prompt only")
+                    # Create appropriate content parts based on input type
+                    contents = prepare_response(
+                        prompt,
+                        "image" if images is not None else ("video" if frames is not None else ("audio" if audio is not None else "text")),
+                        None,
+                        images,
+                        frames,
+                        audio,
+                        max_images,
+                    )
+                
+                # Extract content for chat format (skip if already set by video-file branch)
+                if uploaded_video_file is None:
+                    if (
+                        isinstance(contents, list)
+                        and len(contents) == 1
+                        and isinstance(contents[0], dict)
+                        and "parts" in contents[0]
+                    ):
+                        current_message_parts = contents[0]["parts"]
+                    else:
+                        # Fallback if we get unexpected format
+                        current_message_parts = [{"text": prompt}]
+                        logger.warning("Unexpected format from prepare_response, using text prompt only")
 
                 try:
                     # Create chat session with proper history (Gemini)
@@ -574,15 +650,24 @@ class Soze_GeminiAdvanced:
 
             else:
                 # Standard non-chat mode - prepare content for each input type
-                contents = prepare_response(
-                    prompt,
-                    "image" if images is not None else "text",
-                    None,
-                    images,
-                    video,
-                    audio,
-                    max_images,
-                )
+                if uploaded_video_file is not None:
+                    contents = [types.Content(role="user", parts=[
+                        types.Part(text=prompt),
+                        types.Part(file_data=types.FileData(
+                            file_uri=uploaded_video_file.uri,
+                            mime_type=uploaded_video_file.mime_type,
+                        )),
+                    ])]
+                else:
+                    contents = prepare_response(
+                        prompt,
+                        "image" if images is not None else ("video" if frames is not None else "text"),
+                        None,
+                        images,
+                        frames,
+                        audio,
+                        max_images,
+                    )
 
                 # Generate content using the model
                 response = client.generate_content(
