@@ -202,7 +202,7 @@ try:
                     # Always include these models even if API doesn't return them
                     default_models = [
                         "gemini-3-flash-preview",
-                        "gemini-3-pro-preview",
+                        "gemini-3.1-pro-preview",
                         "gemini-3-pro-image-preview",
                     ]
                     
@@ -233,7 +233,7 @@ try:
                     return web.json_response({
                         "status": "error",
                         "message": error_detail,
-                        "models": ["gemini-3-flash-preview", "gemini-3-pro-preview", "gemini-3-pro-image-preview"]
+                        "models": ["gemini-3-flash-preview", "gemini-3.1-pro-preview", "gemini-3-pro-image-preview"]
                     })
                     
             except Exception as e:
@@ -241,7 +241,7 @@ try:
                 return web.json_response({
                     "status": "error", 
                     "message": f"Error in server: {str(e)}",
-                    "models": ["gemini-3-flash-preview", "gemini-3-pro-preview"]  # Default fallback
+                    "models": ["gemini-3-flash-preview", "gemini-3.1-pro-preview"]  # Default fallback
                 })
 
         @PromptServer.instance.routes.post("/gemini/get_models")
@@ -315,10 +315,10 @@ try:
                     # Return default models if no API key found
                     return web.json_response([
                         "gemini-3-flash-preview",
-                        "gemini-3-pro-preview",
+                        "gemini-3.1-pro-preview",
                         "gemini-3-pro-image-preview"
                     ])
-                
+
                 # Use the get_available_models function from gemini_node.py
                 from .gemini_node import get_available_models
                 
@@ -331,7 +331,7 @@ try:
                 logger.error(f"Error in get_models_for_ui: {str(e)}")
                 return web.json_response([
                     "gemini-3-flash-preview",
-                    "gemini-3-pro-preview",
+                    "gemini-3.1-pro-preview",
                     "gemini-3-pro-image-preview"
                 ])
         

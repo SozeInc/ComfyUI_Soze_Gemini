@@ -42,6 +42,30 @@ I am happy to accept PRs and bug reports and will integrate or resolve as possib
    - Clear History: Clear chat history when enabled (works with Chat Mode)
    - Seed: For reproducible results
 
+## Vertex AI Nodes
+
+In addition to the AI Studio node above, there are two nodes that call Google Cloud's **Vertex AI** using the same `google-genai` SDK. They read their own credentials, kept completely separate from `GEMINI_API_KEY`:
+
+| Env var | Purpose |
+| --- | --- |
+| `VERTEX_API_KEY` | Vertex AI **express mode** API key |
+| `VERTEX_PROJECT_ID` | GCP project id (falls back to `GOOGLE_CLOUD_PROJECT`) |
+| `VERTEX_LOCATION` | Region, e.g. `us-central1` or `global` (falls back to `GOOGLE_CLOUD_LOCATION`) |
+
+These can be set as system env vars, in your shell config, or in a `.env` file (same lookup as the Gemini key). Each node also exposes optional fields to override the API key (`external_api_key` / `vertex_api_key`), project, and location per-node.
+
+- **Vertex Gemini (Soze)** — Gemini text / multimodal analysis / image generation via Vertex (including the Gemini "Nano Banana" image models). Same inputs and behaviour as the AI Studio node, just pointed at Vertex.
+
+> **Auth modes:** Set `VERTEX_API_KEY` for express mode (closest to the AI Studio flow). Alternatively, set `VERTEX_PROJECT_ID` + `VERTEX_LOCATION` and authenticate with `gcloud auth application-default login` to use Application Default Credentials (ADC). For ADC, leave the API key blank and provide a project — the nodes detect this and use ADC automatically. A service-account JSON works too: set `GOOGLE_APPLICATION_CREDENTIALS` to the key path.
+
+> **Model IDs differ from AI Studio.** Vertex uses different model id strings (e.g. AI Studio's `gemini-3.1-flash-image-preview` is `gemini-3.1-flash-image` on Vertex). The Vertex Gemini node ships a Vertex-specific dropdown, but exact availability still depends on your **project, region, and express-vs-standard** access. A `404 NOT_FOUND ... was not found or your project does not have access to it` error means the chosen model isn't available to your setup. To see what *is* available, run the diagnostic:
+>
+> ```powershell
+> & ".venv\Scripts\python.exe" list_vertex_models.py
+> ```
+>
+> Then pick a listed model. Image-generation models also tend to require a real region (e.g. `us-central1`) rather than `global`.
+
 ## Troubleshooting
 
 - If you encounter API key errors, use the "Verify API Key" button to check its validity

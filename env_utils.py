@@ -216,17 +216,61 @@ def get_base_url():
 def get_effective_api_key():
     """
     Get the effective API key to use - only Gemini API key
-    
+
     Returns:
         tuple: (api_key, source_type) where source_type is "gemini"
     """
     gemini_key = get_api_key("GEMINI_API_KEY", "Gemini")
-    
+
     if gemini_key:
         logger.info("Using Gemini API key")
         return gemini_key, "gemini"
-    
+
     # Log what keys were found for debugging
     logger.warning("No Gemini API key found")
-    
+
     return "", "none"
+
+
+def get_vertex_config():
+    """
+    Get Vertex AI configuration, kept entirely separate from the AI Studio
+    GEMINI_API_KEY so the two backends never share credentials.
+
+    Reads (env vars, shell configs, and .env files are all honoured via the
+    same lookup used for the Gemini key):
+        VERTEX_API_KEY      - Vertex AI "express mode" API key
+        VERTEX_PROJECT_ID   - GCP project id (falls back to GOOGLE_CLOUD_PROJECT)
+        VERTEX_LOCATION     - region, e.g. "us-central1" or "global"
+                              (falls back to GOOGLE_CLOUD_LOCATION)
+
+    Returns:
+        dict with keys: api_key, project, location
+    """
+    api_key = get_api_key("VERTEX_API_KEY", "Vertex")
+
+    project = (
+        os.environ.get("VERTEX_PROJECT_ID")
+        or os.environ.get("GOOGLE_CLOUD_PROJECT")
+        or ""
+    ).strip()
+
+    location = (
+        os.environ.get("VERTEX_LOCATION")
+        or os.environ.get("GOOGLE_CLOUD_LOCATION")
+        or ""
+    ).strip()
+
+    if api_key:
+        masked = api_key[:5] + "..." if len(api_key) > 5 else "****"
+        logger.info(
+            f"Loaded Vertex config (key: {masked}, project: {project or '(none)'}, "
+            f"location: {location or '(none)'})"
+        )
+    else:
+        logger.info(
+            f"No VERTEX_API_KEY found; Vertex project: {project or '(none)'}, "
+            f"location: {location or '(none)'}"
+        )
+
+    return {"api_key": api_key, "project": project, "location": location}

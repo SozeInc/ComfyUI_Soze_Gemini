@@ -23,6 +23,9 @@ import uuid
 import hashlib
 import requests
 import json
+import shutil
+import subprocess
+import tempfile
 
 try:
     from google import genai
@@ -46,6 +49,87 @@ SUPPORTED_VIDEO_EXTS = {
 }
 
 
+def _ffprobe_stream_types(video_path):
+    """Return the list of codec_type values for every stream, or None if ffprobe is unavailable/failed."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        result = subprocess.run(
+            [ffprobe, "-v", "error", "-show_entries", "stream=codec_type",
+             "-of", "default=nw=1:nk=1", video_path],
+            capture_output=True, text=True, timeout=30, check=True,
+        )
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError) as e:
+        logger.warning(f"ffprobe failed on {video_path}: {e}")
+        return None
+
+
+def sanitize_video_for_gemini(video_path):
+    """If the video has streams Gemini may reject (data/subtitle/attachment/etc.),
+    losslessly remux to a temp file keeping only video + audio.
+
+    Returns a tuple (path_to_use, temp_path_to_clean_up_or_None). The caller is
+    responsible for deleting temp_path after the upload call returns.
+    Gracefully no-ops if ffmpeg/ffprobe aren't available.
+    """
+    stream_types = _ffprobe_stream_types(video_path)
+    if stream_types is None:
+        logger.info("ffprobe not available — skipping video sanitize step")
+        return video_path, None
+
+    # Keep only video + audio. Anything else (data, subtitle, attachment) is suspect.
+    bad_streams = [s for s in stream_types if s not in ("video", "audio")]
+    if not bad_streams:
+        logger.info(f"Video streams look clean ({stream_types}), no sanitize needed")
+        return video_path, None
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        logger.warning(
+            f"Video has non-media streams {bad_streams} that Gemini may reject, "
+            f"but ffmpeg is not on PATH — skipping sanitize. "
+            f"Install ffmpeg or remux manually if upload fails."
+        )
+        return video_path, None
+
+    # Remux to a temp file, copy codecs (lossless, fast).
+    fd, tmp_path = tempfile.mkstemp(suffix=os.path.splitext(video_path)[1] or ".mp4",
+                                    prefix="gemini_sanitized_")
+    os.close(fd)
+    logger.info(
+        f"Stripping non-media streams {bad_streams} from video via ffmpeg remux → {tmp_path}"
+    )
+    try:
+        subprocess.run(
+            [ffmpeg, "-y", "-i", video_path,
+             "-map", "0:v", "-map", "0:a",
+             "-c", "copy", "-movflags", "+faststart",
+             tmp_path],
+            capture_output=True, text=True, timeout=600, check=True,
+        )
+    except subprocess.CalledProcessError as e:
+        logger.warning(
+            f"ffmpeg sanitize failed (exit {e.returncode}): {e.stderr[-500:] if e.stderr else ''}. "
+            f"Falling back to original file."
+        )
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return video_path, None
+    except subprocess.TimeoutExpired:
+        logger.warning("ffmpeg sanitize timed out — falling back to original file")
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        return video_path, None
+
+    return tmp_path, tmp_path
+
+
 def upload_video_for_gemini(client, video_path, poll_timeout=300, poll_interval=2):
     """Upload a video file via the Files API and wait until it's ACTIVE.
 
@@ -64,8 +148,97 @@ def upload_video_for_gemini(client, video_path, poll_timeout=300, poll_interval=
         )
 
     raw_client = client.client if isinstance(client, UniversalClient) else client
-    logger.info(f"Uploading video to Gemini Files API: {video_path}")
-    uploaded = raw_client.files.upload(file=video_path)
+    mime_type = SUPPORTED_VIDEO_EXTS[ext]
+
+    # Strip any non-video/non-audio streams that Gemini's processor may reject.
+    upload_path, tmp_to_clean = sanitize_video_for_gemini(video_path)
+    file_size = os.path.getsize(upload_path)
+    display_name = os.path.basename(upload_path)
+
+    # Log everything that could matter for diagnosing upload failures.
+    try:
+        import google.genai as _g
+        sdk_version = getattr(_g, "__version__", "unknown")
+    except Exception:
+        sdk_version = "unknown"
+    base_url_dbg = get_base_url() or "(default)"
+    logger.info(
+        f"Uploading video to Gemini Files API: path={upload_path} "
+        f"size={file_size} bytes ({file_size / (1024*1024):.2f} MB) "
+        f"mime={mime_type} display_name={display_name} "
+        f"sdk={sdk_version} base_url={base_url_dbg}"
+    )
+
+    # Pass explicit mime_type + display_name via UploadFileConfig.
+    # Open as a binary file handle to rule out any path-string ambiguity in older SDKs.
+    def _do_upload(file_arg, with_config):
+        if with_config:
+            cfg = types.UploadFileConfig(mime_type=mime_type, display_name=display_name)
+            return raw_client.files.upload(file=file_arg, config=cfg)
+        return raw_client.files.upload(file=file_arg)
+
+    uploaded = None
+    last_err = None
+    for use_handle in (True, False):  # try handle first, then fall back to path
+        for with_cfg in (True, False):
+            try:
+                if use_handle:
+                    with open(upload_path, "rb") as fh:
+                        uploaded = _do_upload(fh, with_cfg)
+                else:
+                    uploaded = _do_upload(upload_path, with_cfg)
+                logger.info(
+                    f"files.upload() returned (handle={use_handle}, config={with_cfg})"
+                )
+                break
+            except (AttributeError, TypeError) as e:
+                last_err = e
+                logger.warning(
+                    f"files.upload() rejected args (handle={use_handle}, config={with_cfg}): {e}"
+                )
+                continue
+        if uploaded is not None:
+            break
+    if uploaded is None:
+        raise RuntimeError(f"All upload call shapes failed; last error: {last_err}")
+
+    # Dump everything Gemini knows about the file we just sent.
+    initial_info = {
+        "name": getattr(uploaded, "name", None),
+        "uri": getattr(uploaded, "uri", None),
+        "mime_type": getattr(uploaded, "mime_type", None),
+        "size_bytes": getattr(uploaded, "size_bytes", None),
+        "display_name": getattr(uploaded, "display_name", None),
+        "state": getattr(getattr(uploaded, "state", None), "name", str(getattr(uploaded, "state", ""))),
+    }
+    logger.info(f"Initial File state from API: {initial_info}")
+    if initial_info["size_bytes"] in (None, 0):
+        logger.error(
+            f"Gemini reports size_bytes={initial_info['size_bytes']} for an upload of "
+            f"{file_size} local bytes — the upload body did not reach the API."
+        )
+
+    # Gemini has its own copy now — safe to delete the local temp file.
+    if tmp_to_clean:
+        try:
+            os.remove(tmp_to_clean)
+            logger.info(f"Cleaned up sanitized temp file: {tmp_to_clean}")
+        except OSError as e:
+            logger.warning(f"Could not delete temp file {tmp_to_clean}: {e}")
+
+    def _describe_error(file_obj):
+        """Pull whatever diagnostic info the File object carries."""
+        err = getattr(file_obj, "error", None)
+        if err is not None:
+            code = getattr(err, "code", None)
+            msg = getattr(err, "message", None) or str(err)
+            return f"code={code} message={msg}"
+        # Some SDKs expose .state_reason / .state_message
+        for attr in ("state_reason", "state_message", "status"):
+            val = getattr(file_obj, attr, None)
+            if val:
+                return f"{attr}={val}"
+        return "no error details returned by API"
 
     deadline = time.time() + poll_timeout
     while True:
@@ -74,7 +247,23 @@ def upload_video_for_gemini(client, video_path, poll_timeout=300, poll_interval=
             logger.info(f"Video file is ACTIVE: {uploaded.name}")
             return uploaded
         if state == "FAILED":
-            raise RuntimeError(f"Video upload FAILED for {video_path}")
+            detail = _describe_error(uploaded)
+            # Dump every attribute on the File object so we can see exactly what
+            # Gemini received and complained about.
+            try:
+                dump = {k: getattr(uploaded, k) for k in dir(uploaded)
+                        if not k.startswith("_") and not callable(getattr(uploaded, k, None))}
+                # Convert non-stringable values
+                dump_safe = {k: (str(v)[:300] if v is not None else None) for k, v in dump.items()}
+                logger.error(f"Full File object on FAILED state: {dump_safe}")
+            except Exception as dump_err:
+                logger.error(f"Could not dump File object: {dump_err}")
+            raise RuntimeError(
+                f"Video upload FAILED for {video_path}: {detail}. "
+                f"(local size={file_size / (1024*1024):.1f} MB, "
+                f"api size_bytes={getattr(uploaded, 'size_bytes', '?')}, mime={mime_type}). "
+                f"See log above for full File object dump."
+            )
         if time.time() > deadline:
             raise TimeoutError(
                 f"Video upload did not become ACTIVE within {poll_timeout}s (last state: {state})"
@@ -89,8 +278,11 @@ def _build_thinking_config(thinking_level):
 
     Newer SDKs accept `thinking_level` (str: minimal/low/medium/high) for Gemini 3.
     Older SDKs only accept `thinking_budget` (int) — map the level to a budget.
+
+    A thinking_level of "none" means "send no thinking config" — the model uses
+    its own default. (The API has no explicit off switch below "minimal".)
     """
-    if types is None:
+    if types is None or thinking_level == "none":
         return None
     supported = set(getattr(types.ThinkingConfig, "model_fields", {}).keys())
     if "thinking_level" in supported:
@@ -129,7 +321,6 @@ gemini_models = [
             "gemini-3.1-flash-image-preview",
             "gemini-3.1-flash-lite-preview",
             "gemini-3-flash-preview",
-            "gemini-3-pro-preview",
             ]
 gemini_image_models = [
                 "gemini-3-pro-image-preview",
@@ -223,8 +414,54 @@ def create_gemini_client(api_key, api_key_source="unknown"):
         # Use default endpoint
         logger.info(f"Creating Gemini client with default endpoint (API key: {masked_key}, source: {api_key_source})")
         client = genai.Client(api_key=api_key)
-    
+
     return client
+
+
+def create_vertex_client(api_key=None, project=None, location=None, api_key_source="vertex"):
+    """
+    Create a Vertex AI-backed genai client.
+
+    Uses the same google-genai SDK as the AI Studio path, just pointed at
+    Vertex (vertexai=True). The downstream generate_content / generate_images
+    calls are identical, so this client is interchangeable with the AI Studio
+    one everywhere UniversalClient is used.
+
+    Args:
+        api_key: Vertex "express mode" API key (optional if using project/location).
+        project: GCP project id (optional in express mode).
+        location: GCP region, e.g. "us-central1" or "global" (optional in express mode).
+        api_key_source: Source label, for logging only.
+
+    Returns:
+        Configured genai.Client with vertexai=True.
+    """
+    kwargs = {"vertexai": True}
+
+    # google-genai treats api_key and project/location as MUTUALLY EXCLUSIVE.
+    # Express mode: pass only the api_key (it already encodes project+region).
+    # ADC mode: pass project+location and let google.auth resolve credentials.
+    if api_key:
+        kwargs["api_key"] = api_key
+    else:
+        if project:
+            kwargs["project"] = project
+        if location:
+            kwargs["location"] = location
+
+    masked_key = (api_key[:5] + "...") if api_key and len(api_key) > 5 else ("****" if api_key else "(none)")
+    if api_key:
+        logger.info(
+            f"Creating Vertex AI client in express mode (key: {masked_key}, source: {api_key_source}); "
+            f"project/location are ignored in this mode."
+        )
+    else:
+        logger.info(
+            f"Creating Vertex AI client via ADC (project: {project or '(none)'}, "
+            f"location: {location or '(none)'}, source: {api_key_source})"
+        )
+
+    return genai.Client(**kwargs)
 
 
 class UniversalClient:
@@ -341,6 +578,39 @@ class Soze_GeminiAdvanced:
             )
             return False
 
+    # --- Backend hooks (overridden by the Vertex subclass) ----------------
+    # These three methods are the only backend-specific seams. The AI Studio
+    # implementation lives here; Soze_VertexGemini overrides them to talk to
+    # Vertex AI while reusing all of the generation logic below.
+
+    def _resolve_api_key(self, external_api_key=""):
+        """Return (api_key, source) for the AI Studio backend, or (None, None)."""
+        cleaned = external_api_key.strip() if external_api_key else ""
+        if cleaned:
+            logger.info("Using external Gemini API key")
+            return cleaned, "external"
+
+        api_key, _ = get_effective_api_key()
+        if api_key:
+            return api_key, "environment"
+
+        if self.last_external_api_key:
+            logger.info("Using previously provided external API key")
+            return self.last_external_api_key, "cached"
+
+        return None, None
+
+    def _no_key_error(self):
+        """Human-readable error when no usable credential was found."""
+        return (
+            "ERROR: No Gemini API key found. Please set GEMINI_API_KEY in your environment "
+            "or provide it in the external_api_key field."
+        )
+
+    def _make_client(self, api_key, api_key_source="unknown"):
+        """Return (raw_client, client_type) for the AI Studio backend."""
+        return create_appropriate_client(api_key, api_key_source)
+
     @classmethod
     def INPUT_TYPES(s):
         return {
@@ -394,6 +664,10 @@ class Soze_GeminiAdvanced:
     FUNCTION = "generate_content"
     CATEGORY = "Soze Nodes"
 
+    # Image-capable model IDs for this backend. Overridden by the Vertex
+    # subclass, since Vertex uses different model id strings than AI Studio.
+    IMAGE_MODELS = gemini_image_models
+
     def generate_content(
         self,
         prompt,
@@ -440,36 +714,12 @@ class Soze_GeminiAdvanced:
             self.chat_history.clear()
             logger.info("Chat history cleared")
 
-        # API key resolution
-        api_key = None
-        api_key_source = None
-        
-        # Clean and validate external API key
+        # API key resolution (backend-specific via _resolve_api_key)
         cleaned_external_key = external_api_key.strip() if external_api_key else ""
-        
-        if cleaned_external_key:
-            # External key provided
-            api_key = cleaned_external_key
-            api_key_source = "external"
-            logger.info("Using external Gemini API key")
-        else:
-            # Use environment key
-            api_key, key_type = get_effective_api_key()
-            api_key_source = "environment"
-                
-            if not api_key:
-                # Fallback to previously cached external key
-                if self.last_external_api_key:
-                    api_key = self.last_external_api_key
-                    api_key_source = "cached"
-                logger.info("Using previously provided external API key")
+        api_key, api_key_source = self._resolve_api_key(external_api_key)
 
         if not api_key:
-            return (
-                "ERROR: No Gemini API key found. Please set GEMINI_API_KEY in your environment "
-                "or provide it in the external_api_key field.",
-                create_placeholder_image(),
-            )
+            return (self._no_key_error(), create_placeholder_image())
         # Generate a consistent seed for this operation
         operation_seed = generate_consistent_seed(seed, use_random_seed)
 
@@ -495,7 +745,7 @@ class Soze_GeminiAdvanced:
 
         # Initialize the API client with the API key
         try:
-            raw_client, client_type = create_appropriate_client(api_key, api_key_source)
+            raw_client, client_type = self._make_client(api_key, api_key_source)
             client = UniversalClient(raw_client, client_type)
             logger.info(f"Using Gemini client for API calls")
         except Exception as e:
@@ -738,7 +988,7 @@ class Soze_GeminiAdvanced:
             # This determination of `client_type` must happen before the model name is validated.
             # We peek ahead to see what client will be created.
             # For Gemini, model names should be image-capable
-            image_capable_models = gemini_image_models
+            image_capable_models = self.IMAGE_MODELS
             if model_name not in image_capable_models:
                 original_model = model_name
                 model_name = image_capable_models[0]  # A safe default for Gemini
@@ -747,41 +997,17 @@ class Soze_GeminiAdvanced:
                     f"Switched to '{model_name}'."
                 )
 
-            # Use the API key based on the source specified
-            api_key = None
-            
-            if api_key_source == "external" and external_api_key:
-                api_key = external_api_key
-                logger.info("Using external API key provided in the node for image generation")
-            elif api_key_source == "system" and os.environ.get("GEMINI_API_KEY"):
-                api_key = os.environ.get("GEMINI_API_KEY")
-                logger.info(f"Using GEMINI_API_KEY from system environment variable for image generation")
-            elif api_key_source == "loaded" and self.api_key:
-                api_key = self.api_key
-                logger.info("Using API key from previously loaded environment for image generation")
-            elif api_key_source == "cached" and self.last_external_api_key:
-                api_key = self.last_external_api_key
-                logger.info("Using cached external API key for image generation")
-            elif external_api_key:  # Fallback to direct external key if source not set
-                api_key = external_api_key
-                logger.info("Using direct external API key for image generation")
-            elif os.environ.get("GEMINI_API_KEY"):  # Fallback to system env
-                api_key = os.environ.get("GEMINI_API_KEY")
-                logger.info("Using GEMINI_API_KEY from system environment for image generation")
-            elif self.api_key:  # Fallback to instance variable
-                api_key = self.api_key
-                logger.info("Using instance API key for image generation")
-            elif self.last_external_api_key:  # Last resort cached key
-                api_key = self.last_external_api_key
-                logger.info("Using last resort cached API key for image generation")
-            
-            if not api_key:
-                error_msg = "ERROR: No API key available for image generation. Please set GEMINI_API_KEY in your environment or provide it in the external_api_key field."
-                return (error_msg, create_placeholder_image())
+            # Resolve the credential via the backend hook (AI Studio or Vertex)
+            api_key, resolved_source = self._resolve_api_key(external_api_key)
+            if api_key_source is None:
+                api_key_source = resolved_source
 
-            # Create Gemini client
+            if not api_key:
+                return (self._no_key_error(), create_placeholder_image())
+
+            # Create the client (AI Studio or Vertex, per the backend hook)
             try:
-                raw_client, client_type = create_appropriate_client(api_key, api_key_source)
+                raw_client, client_type = self._make_client(api_key, api_key_source)
                 client = UniversalClient(raw_client, client_type)
                 logger.info("Using Gemini client for image generation")
             except Exception as e:
